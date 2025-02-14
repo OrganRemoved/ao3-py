@@ -1,0 +1,15 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ao3-py"
+version  = "2025.2.14"
+dependencies = ["beautifulsoup4", "lxml", "requests"]
+requires-python = ">=3"
+description = "An unofficial python sdk for [Archive Of Our Own (AO3)](https://archiveofourown.org)."
+readme = "README.md"
+license = {text = "MIT License"}
+
+[tool.hatch.build.targets.wheel]
+packages = ["ao3"]
