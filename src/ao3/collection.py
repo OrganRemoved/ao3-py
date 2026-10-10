@@ -363,7 +363,7 @@ class Collection:
         return self.works_page.works
 
     @property
-    def works_count(self) -> int:
+    def works_count(self) -> int | None:
         data = (
             self.__dict__.get("detail") or self.__dict__.get("_summary") or self.detail
         )
@@ -382,7 +382,7 @@ class Collection:
         return self.bookmarks_page.bookmarks
 
     @property
-    def bookmarks_count(self) -> int:
+    def bookmarks_count(self) -> int | None:
         data = (
             self.__dict__.get("detail") or self.__dict__.get("_summary") or self.detail
         )
@@ -418,6 +418,8 @@ class Collection:
 
     @staticmethod
     def parse_blurb(article: BeautifulSoup) -> "Collection.Data | None":
+        from ao3.work import Work
+
         if (heading := article.select_one("div.header.module h4.heading")) is None or (
             title_link := heading.select_one("a[href*='/collections/']")
         ) is None:
@@ -491,7 +493,7 @@ class Collection:
             name,
             f"/collections/{quote(name, safe='')}",
             title_link.get_text(" ", strip=True),
-            description.get_text(" ", strip=True) or None if description else None,
+            Work.user_text(description),
             description_html,
             None,
             updated,
@@ -519,9 +521,15 @@ class Collection:
         content: bytes | str, requested_page: int
     ) -> "Collection.Page.Data":
         soup = BeautifulSoup(content, "lxml")
+        main = soup.select_one("#main") or soup
         listing = soup.select_one("ul.collection.picture.index.group")
 
-        if not listing and not soup.select_one("h2.heading"):
+        heading = main.select_one("h3.heading:not(.landmark)")
+        if listing is None and not (
+            heading
+            and heading.get_text(" ", strip=True)
+            == "Sorry, there were no collections found."
+        ):
             raise AO3ParseError("The AO3 collection index was not found")
 
         collections = tuple(
@@ -545,7 +553,6 @@ class Collection:
             "ol.pagination.actions [aria-current=page], div.pagination .current"
         )
 
-        heading = soup.select_one("h3.heading")
         total_match = re.search(
             r"(?P<count>[0-9][0-9,]*)\s+Collections?\b",
             heading.get_text(" ", strip=True) if heading else "",
@@ -565,6 +572,8 @@ class Collection:
 
     @staticmethod
     def parse_profile(content: bytes | str, name: str) -> "Collection.Data":
+        from ao3.work import Work
+
         soup = BeautifulSoup(content, "lxml")
 
         if (profile := soup.select_one("div.collection.home.profile")) is None:
@@ -634,7 +643,7 @@ class Collection:
             section = profile.select_one(f"div#{section_id} blockquote.userstuff")
             sections.append(
                 (
-                    section.get_text(" ", strip=True) or None,
+                    Work.user_text(section),
                     "".join(str(child) for child in section.contents).strip() or None,
                 )
                 if section
@@ -652,7 +661,7 @@ class Collection:
             name,
             f"/collections/{quote(name, safe='')}",
             title,
-            description.get_text(" ", strip=True) or None if description else None,
+            Work.user_text(description),
             description_html,
             active_since,
             None,

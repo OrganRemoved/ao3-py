@@ -285,10 +285,11 @@ class Comment:
             return None
 
         comment_id = int(match["comment_id"])
-        deleted = (
-            "previous comment deleted" in article.get_text(" ", strip=True).lower()
-        )
         heading = article.select_one("h4.heading.byline")
+        deleted = heading is None and any(
+            "previous comment deleted" in element.get_text(" ", strip=True).lower()
+            for element in article.select(":scope > p")
+        )
 
         if heading is None or deleted:
             pseud_reference, guest_name, by_anonymous_creator = None, None, False
@@ -406,11 +407,26 @@ class Comment:
                 ):
                     replies_count += int(count_match["count"].replace(",", ""))
 
+        elif (
+            wrapper is not None
+            and not wrapper.get("id")
+            and (
+                count_match := re.search(
+                    r"(?P<count>[0-9][0-9,]*)\s+more comments?",
+                    wrapper.get_text(" ", strip=True),
+                    re.IGNORECASE,
+                )
+            )
+        ):
+            replies_count = int(count_match["count"].replace(",", ""))
+
         replies_count += len(replies)
 
         classes = {str(value) for value in article.get("class", [])}
-        notice = article.select_one("p.notice, p.message")
-        notice_text = notice.get_text(" ", strip=True).lower() if notice else ""
+        notice_text = " ".join(
+            notice.get_text(" ", strip=True).lower()
+            for notice in article.select(":scope > p.notice, :scope > p.message")
+        )
 
         return Comment.Data(
             comment_id,
@@ -443,6 +459,15 @@ class Comment:
     ) -> "Comment.Page.Data":
         soup = BeautifulSoup(content, "lxml")
 
+        if total is None and (feedback := soup.select_one("div#feedback")) is not None:
+            count_link = feedback.select_one("#show_comments_link")
+            count = (
+                re.search(r"\(([0-9][0-9,]*)\)", count_link.get_text())
+                if count_link
+                else None
+            )
+            total = int(count[1].replace(",", "")) if count else 0
+
         if (
             total is None
             and (comments_stat := soup.select_one("dd.comments")) is not None
@@ -455,7 +480,7 @@ class Comment:
         container = soup.select_one("div#comments_placeholder") or soup
 
         if (thread := container.select_one("ol.thread")) is None:
-            if soup.select_one("form#new_user, form.new_user"):
+            if soup.select_one("form#new_user, #loginform form.new_user"):
                 raise AO3AuthenticationError("AO3 comments require a login")
 
             if soup.select_one("div#feedback"):

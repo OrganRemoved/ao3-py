@@ -38,7 +38,7 @@ class ExternalWork:
             self,
             external_work_id: int,
             path: str,
-            url: str,
+            url: str | None,
             title: str,
             author: str,
             tags: tuple[Tag.Reference, ...],
@@ -132,12 +132,17 @@ class ExternalWork:
 
     @property
     def url(self) -> str:
-        if detail := self.__dict__.get("detail"):
-            return detail.url
-
-        if summary := self.__dict__.get("_summary"):
+        if (
+            (summary := self.__dict__.get("_summary"))
+            and summary.url is not None
+            and "detail" not in self.__dict__
+        ):
             return summary.url
 
+        if self.detail.url is None:
+            raise AO3ParseError(
+                f"External work {self.id} did not expose its target URL"
+            )
         return self.detail.url
 
     @property
@@ -229,10 +234,16 @@ class ExternalWork:
 
     @staticmethod
     def parse_blurb(article: BeautifulSoup) -> "ExternalWork.Data | None":
+        from ao3.work import Work
+
         if (heading := article.select_one("div.header.module h4.heading")) is None:
             return None
 
-        ao3_link = heading.select_one("a[href*='/external_works/']")
+        ao3_link = (
+            None
+            if str(article.get("id", "")).startswith("external_work_")
+            else heading.select_one("a[href^='/external_works/']")
+        )
 
         if not (
             id_match := re.search(
@@ -255,12 +266,7 @@ class ExternalWork:
         if (title_link := ao3_link or heading.select_one("a[href]")) is None:
             return None
 
-        target_url = str(title_link["href"])
-
-        if target_url.startswith("/") and (
-            external_target := article.select_one("a[href^='http']")
-        ):
-            target_url = str(external_target["href"])
+        target_url = None if ao3_link is not None else str(title_link["href"])
 
         heading_copy = BeautifulSoup(str(heading), "lxml")
 
@@ -275,6 +281,17 @@ class ExternalWork:
         )
 
         tags = []
+        if rating := article.select_one("ul.required-tags span.rating"):
+            name = str(rating.get("title") or rating.get_text(" ", strip=True))
+            tags.append(Tag.Reference(name, Tag.path(name), "rating"))
+        if categories := article.select_one("ul.required-tags span.category"):
+            names = str(categories.get("title", ""))
+            if names.casefold() != "no category":
+                tags.extend(
+                    Tag.Reference(name, Tag.path(name), "category")
+                    for name in names.split(", ")
+                    if name
+                )
         selectors: tuple[tuple[str, TagKind], ...] = (
             ("h5.fandoms a.tag[href]", "fandom"),
             ("ul.tags > li.warnings a.tag[href]", "warning"),
@@ -322,7 +339,7 @@ class ExternalWork:
             title_link.get_text(" ", strip=True),
             author,
             tuple(tags),
-            summary.get_text(" ", strip=True) or None if summary else None,
+            Work.user_text(summary),
             summary_html,
             Language.Reference.from_element(article.select_one("dd.language")),
             created,

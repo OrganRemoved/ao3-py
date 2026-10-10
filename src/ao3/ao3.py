@@ -38,19 +38,22 @@ class AO3Client:
         timeout: float | httpx.Timeout = 30,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
-        self.http = httpx.Client(
-            base_url=base_url,
-            cookies=cookies,
-            follow_redirects=True,
-            headers={
+        request_headers = httpx.Headers(
+            {
                 "Accept": "text/html,application/xhtml+xml",
-                **(headers or {}),
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/153.0.0.0 Safari/537.36"
                 ),
-            },
+            }
+        )
+        request_headers.update(headers or {})
+        self.http = httpx.Client(
+            base_url=base_url,
+            cookies=cookies,
+            follow_redirects=True,
+            headers=request_headers,
             http2=True,
             timeout=timeout,
             transport=transport,
@@ -207,7 +210,14 @@ class AO3Client:
         if tag.view_adult:
             params["view_adult"] = "true"
 
-        data = Work.parse_index(self.get(tag.link, params=params).content, tag.page)
+        response = self.get(tag.link, params=params)
+        if (
+            response.history
+            and tag.page != 1
+            and response.url.params.get("page") != str(tag.page)
+        ):
+            response = self.get(str(response.url), params=params)
+        data = Work.parse_index(response.content, tag.page)
 
         return Work.Page(
             data.page,
@@ -225,10 +235,14 @@ class AO3Client:
         if tag.view_adult:
             params["view_adult"] = "true"
 
-        data = Bookmark.parse_index(
-            self.get(Tag.path(tag.name, bookmarks=True), params=params).content,
-            tag.page,
-        )
+        response = self.get(Tag.path(tag.name, bookmarks=True), params=params)
+        if (
+            response.history
+            and tag.page != 1
+            and response.url.params.get("page") != str(tag.page)
+        ):
+            response = self.get(str(response.url), params=params)
+        data = Bookmark.parse_index(response.content, tag.page)
 
         return Bookmark.Page(
             data.page,
@@ -238,6 +252,7 @@ class AO3Client:
                 Bookmark.from_data(bookmark, view_adult=tag.view_adult, client=self)
                 for bookmark in data.bookmarks
             ),
+            grouped=data.grouped,
         )
 
     def fetch_language_works(self, language: Language) -> Work.Page:
@@ -329,7 +344,11 @@ class AO3Client:
         email: str | None = None,
     ) -> Comment:
         if isinstance(commentable, Work):
-            path = f"/works/{commentable.id}/comments/new"
+            path = (
+                f"/works/{commentable.id}/chapters/{commentable.chapter_id}/comments/new"
+                if commentable.chapter_id is not None
+                else f"/works/{commentable.id}/comments/new"
+            )
             params = {"view_adult": "true"} if commentable.view_adult else None
 
         elif isinstance(commentable, Chapter):
@@ -384,7 +403,8 @@ class AO3Client:
         soup = BeautifulSoup(response.content, "lxml")
 
         if error := soup.select_one(
-            "#error_explanation, #errorExplanation, .errorExplanation, div.flash.error"
+            "#error_explanation, #errorExplanation, .errorExplanation, "
+            "div.flash.error, div.flash.comment_error"
         ):
             raise AO3ActionError(error.get_text(" ", strip=True))
 
@@ -481,6 +501,7 @@ class AO3Client:
                 Bookmark.from_data(bookmark, view_adult=work.view_adult, client=self)
                 for bookmark in data.bookmarks
             ),
+            grouped=data.grouped,
         )
 
     def create_bookmark(
@@ -499,7 +520,7 @@ class AO3Client:
 
         if (
             form := BeautifulSoup(page.content, "lxml").select_one(
-                "form#new_bookmark[action]"
+                "#bookmark-form form[action], form#new_bookmark[action]"
             )
         ) is None:
             raise AO3ActionError(
@@ -579,9 +600,7 @@ class AO3Client:
             data.page_count,
             data.total,
             tuple(
-                Pseud.from_reference(
-                    pseud, page=user.page, view_adult=user.view_adult, client=self
-                )
+                Pseud.from_reference(pseud, view_adult=user.view_adult, client=self)
                 for pseud in data.pseuds
             ),
         )
@@ -621,9 +640,7 @@ class AO3Client:
             data.page_count,
             data.total,
             tuple(
-                Series.from_summary(
-                    series, page=user.page, view_adult=user.view_adult, client=self
-                )
+                Series.from_summary(series, view_adult=user.view_adult, client=self)
                 for series in data.series
             ),
         )
@@ -646,6 +663,7 @@ class AO3Client:
                 Bookmark.from_data(bookmark, view_adult=user.view_adult, client=self)
                 for bookmark in data.bookmarks
             ),
+            grouped=data.grouped,
         )
 
     def fetch_user_collections(self, user: User) -> Collection.Page:
@@ -660,7 +678,7 @@ class AO3Client:
             data.total,
             tuple(
                 Collection.from_summary(
-                    collection, page=user.page, view_adult=user.view_adult, client=self
+                    collection, view_adult=user.view_adult, client=self
                 )
                 for collection in data.collections
             ),
@@ -701,9 +719,7 @@ class AO3Client:
             data.page_count,
             data.total,
             tuple(
-                Series.from_summary(
-                    series, page=pseud.page, view_adult=pseud.view_adult, client=self
-                )
+                Series.from_summary(series, view_adult=pseud.view_adult, client=self)
                 for series in data.series
             ),
         )
@@ -726,6 +742,7 @@ class AO3Client:
                 Bookmark.from_data(bookmark, view_adult=pseud.view_adult, client=self)
                 for bookmark in data.bookmarks
             ),
+            grouped=data.grouped,
         )
 
     def fetch_series(self, series: Series) -> tuple[Series.Data, Work.Page]:
@@ -770,6 +787,7 @@ class AO3Client:
                 Bookmark.from_data(bookmark, view_adult=series.view_adult, client=self)
                 for bookmark in data.bookmarks
             ),
+            grouped=data.grouped,
         )
 
     def fetch_comment(self, comment: Comment) -> Comment.Data:
@@ -918,9 +936,14 @@ class AO3Client:
             },
             headers={"Accept": "application/json", "Referer": str(page.url)},
         )
-        payload = response.json()
+        try:
+            payload = response.json()
+        except ValueError as error:
+            raise AO3ParseError(
+                "AO3 did not return the created subscription"
+            ) from error
 
-        if "item_id" not in payload:
+        if not isinstance(payload, dict) or "item_id" not in payload:
             raise AO3ParseError("AO3 did not return the created subscription")
 
         return Subscription(
@@ -970,7 +993,7 @@ class AO3Client:
                 f"This session is not subscribed to {subscribable_type}"
             )
 
-        self.post(
+        response = self.post(
             str(form["action"]),
             data={
                 str(element["name"]): str(element.get("value", ""))
@@ -978,6 +1001,14 @@ class AO3Client:
             },
             headers={"Accept": "application/json", "Referer": str(page.url)},
         )
+
+        try:
+            payload = response.json()
+        except ValueError as error:
+            raise AO3ParseError("AO3 did not confirm subscription deletion") from error
+
+        if not isinstance(payload, dict) or "item_success_message" not in payload:
+            raise AO3ParseError("AO3 did not confirm subscription deletion")
 
     def mark_for_later(self, work: Work) -> None:
         params = {"view_adult": "true"} if work.view_adult else None
@@ -1200,6 +1231,7 @@ class AO3Client:
                 )
                 for bookmark in data.bookmarks
             ),
+            grouped=data.grouped,
         )
 
     def fetch_collection(self, collection: Collection) -> Collection.Data:
@@ -1248,6 +1280,7 @@ class AO3Client:
                 )
                 for bookmark in data.bookmarks
             ),
+            grouped=data.grouped,
         )
 
     def fetch_subcollections(self, collection: Collection) -> Collection.Page:
@@ -1264,10 +1297,7 @@ class AO3Client:
             data.total,
             tuple(
                 Collection.from_summary(
-                    child,
-                    page=collection.page,
-                    view_adult=collection.view_adult,
-                    client=self,
+                    child, view_adult=collection.view_adult, client=self
                 )
                 for child in data.collections
             ),

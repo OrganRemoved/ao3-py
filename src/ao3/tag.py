@@ -88,12 +88,13 @@ class Tag:
     ) -> "Tag":
         path = "/" + urlparse(url).path.lstrip("/")
 
-        parts = path.split("/")
+        parts = path.rstrip("/").split("/")
 
         if (
-            len(parts) < 4
+            len(parts) not in {3, 4}
             or parts[1] != "tags"
-            or parts[3] not in {"works", "bookmarks"}
+            or not parts[2]
+            or (len(parts) == 4 and parts[3] not in {"works", "bookmarks"})
         ):
             raise AO3InvalidURLError(f"Not an AO3 tag URL: {url}")
 
@@ -156,7 +157,7 @@ class Tag:
         return self.works_page.works
 
     @cached_property
-    def works_count(self) -> int:
+    def works_count(self) -> int | None:
         return self.works_page.total
 
     @cached_property

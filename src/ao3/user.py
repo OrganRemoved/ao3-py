@@ -149,14 +149,11 @@ class User:
     def bio_html(self) -> str | None:
         return self.detail.bio_html
 
-    @cached_property
+    @property
     def default_pseud(self) -> Pseud | None:
         if self.detail.pseuds:
             return Pseud.from_reference(
-                self.detail.pseuds[0],
-                page=self.page,
-                view_adult=self.view_adult,
-                client=self.client,
+                self.detail.pseuds[0], view_adult=self.view_adult, client=self.client
             )
 
     @cached_property
@@ -219,6 +216,8 @@ class User:
 
     @staticmethod
     def parse_profile(content: bytes | str, login: str) -> "User.Data":
+        from ao3.work import Work
+
         soup = BeautifulSoup(content, "lxml")
 
         if (profile := soup.select_one("div.user.home.profile")) is None:
@@ -262,11 +261,7 @@ class User:
                     )
                 )
 
-        header = profile.select_one("div.primary.header.module")
-        title_heading = profile.select_one(":scope > h3.heading")
-
-        if title_heading and header and header.find(title_heading):
-            title_heading = None
+        title_heading = profile.select_one(":scope > h3.heading:not(.landmark)")
 
         bio = profile.select_one("div.bio.module blockquote.userstuff")
         bio_html = (
@@ -281,7 +276,7 @@ class User:
             user_id,
             joined,
             title_heading.get_text(" ", strip=True) if title_heading else None,
-            bio.get_text(" ", strip=True) or None if bio else None,
+            Work.user_text(bio),
             bio_html,
             tuple(pseud_references),
         )

@@ -1,6 +1,6 @@
 [project]
 name = "ao3-py"
-version = "2026.8.30"
+version = "2026.10.10"
 description = "An unofficial python sdk for [Archive Of Our Own (AO3)](https://archiveofourown.org)."
 readme = "README.md"
 requires-python = ">=3.10"

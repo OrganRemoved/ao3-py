@@ -144,6 +144,12 @@ class Media:
         soup = BeautifulSoup(content, "lxml")
 
         if not soup.select_one("ol.alphabet.fandom.index.group"):
+            main = soup.select_one("#main") or soup
+            if any(
+                heading.get_text(" ", strip=True) == "No fandoms found"
+                for heading in main.select("h3.heading")
+            ):
+                return ()
             raise AO3ParseError("The AO3 fandom index was not found")
 
         fandoms = []

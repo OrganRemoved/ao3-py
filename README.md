@@ -1,11 +1,13 @@
 # ao3-py
 
-An unofficial, typed Python client for [Archive of Our Own](https://archiveofourown.org/).
+An unofficial, typed, synchronous Python SDK for
+[Archive of Our Own](https://archiveofourown.org/).
 
 `ao3-py` turns AO3 pages into lazy domain objects. Constructing a `Work`, `Tag`,
 `User`, or another model creates only a lightweight handle. The first property that
 needs remote data loads it through `httpx`, and the parsed state is then cached on
-that object.
+that object. The SDK reads AO3's HTML pages and submits its forms for supported
+actions.
 
 ## Table of contents
 
@@ -59,8 +61,8 @@ that object.
 - HTTP/2 is preferred when AO3 supports it, with HTTP/1.1 negotiated automatically.
 - List pages produce lightweight, summary-backed models instead of eagerly loading
   every result and causing an N+1 request pattern.
-- Related resources such as tags, pseuds, series, and works are returned as fresh
-  handles, so loading a child does not grow the parent into a large object graph.
+- Metadata relationships such as `work.tags`, `work.pseuds`, and `work.series`
+  return fresh handles. Listing pages retain their parsed result objects.
 - Metadata, full chapter content, and independent listings such as comments or
   bookmarks have separate lazy caches, so callers only pay for the data they use.
 - Plain text and the corresponding parsed HTML fragments are exposed separately
@@ -88,9 +90,10 @@ pip install --upgrade ao3-py
 
 ## Quick start
 
-Examples use symbolic placeholders such as `WORK_ID`, `TAG_NAME`, `TAG_URL`, and
-`SERIES_ID`. Supply them from your own configuration; the documentation deliberately
-does not point at a particular AO3 work, tag, creator, or collection.
+Examples use placeholders such as `WORK_ID`, `TAG_NAME`, `TAG_URL`, and `SERIES_ID`.
+Replace them with the resources you want to access. Later snippets that use `client`
+assume an open `AO3Client`, and snippets that use `work` assume a work created through
+that client.
 
 ```python
 from ao3 import Work
@@ -151,22 +154,27 @@ For a `Work`, these states are deliberately separate:
    statistics.
 2. A metadata-only handle loads `detail` the first time a detail-backed property is
    needed.
-3. `chapters` requests and parses full work content separately.
+3. `chapters` requests and parses content separately, then also updates the work's
+   cached metadata. A chapter-specific handle loads only that chapter's content.
 4. `comments_page`, `bookmarks_page`, and `kudos.detail` are independent listings and
    therefore have independent caches.
 
 This gives list-heavy applications useful summary data without fetching every work,
 while still making the complete resource available through the same object.
 
-There is no parallel `loaded`, `has_next`, or manual `load()` state API. Cached
-properties and the data already present on a summary-backed object are the state.
-Successful write operations invalidate only the affected cache, such as comments,
-bookmarks, or Kudos, so the next read reflects AO3 again.
+Cached properties hold snapshots; there is no automatic refresh interval or public
+`load()` / `refresh()` method. Construct a new handle to read a resource again.
+For a listing, `copy(page=...)` starts with an unloaded page cache.
+
+Successful writes update or invalidate caches on the object performing the action.
+For example, `work.create_comment()` clears that work's `comments_page`, and
+`work.kudos.leave()` clears its Kudos detail. Other handles and already-loaded work
+statistics are not refreshed, even when they refer to the same resource.
 
 ### Lightweight relationships
 
-Relationship properties intentionally return new lightweight handles. This keeps
-loaded state local to the object you chose to use:
+Metadata relationships such as `work.fandoms` return new lightweight handles. Keep
+the returned handle if you want to reuse data loaded through it:
 
 ```python
 first = tag.works[0].fandoms[0]
@@ -175,6 +183,11 @@ second = tag.works[0].fandoms[0]
 assert first is not second
 assert first.name == second.name
 ```
+
+Cached collections retain their items: repeated access to `tag.works`, for example,
+returns the same tuple and work objects. Parsed chapter tuples, comment replies, and
+media fandom listings are also cached. Fresh-handle behavior does not apply to every
+property that returns a model.
 
 ### Clients and connection lifetime
 
@@ -211,18 +224,24 @@ the same cookies and connection pool.
 ```python
 from ao3 import AO3Client
 
-client = AO3Client(
+with AO3Client(
     base_url="https://archiveofourown.org",
-    cookies={"accepted_tos": "20180523"},
+    cookies=COOKIES,
     headers={"Accept-Language": "en-US,en;q=0.9"},
     timeout=60,
-)
-
-client.base_url = "https://archiveofourown.org"
+) as client:
+    work = client.work(WORK_ID)
+    print(work.title)
 ```
 
+`cookies` accepts a dictionary or `httpx.Cookies`; omit it for a new anonymous
+session. `transport` accepts a synchronous `httpx.BaseTransport`, including an
+`httpx.MockTransport` for offline applications or tests.
+
 Model URLs and relative download links are resolved against the owning client's
-current `base_url`.
+current `base_url`. Absolute download URLs retain the host supplied by AO3.
+Changing `base_url`, cookies, or login state does not clear existing model caches;
+create new handles when changing the session or origin.
 
 The built-in client uses a Chrome user agent and enables HTTP/2. `httpx` negotiates
 HTTP/1.1 when HTTP/2 is unavailable. Transport errors and timeouts are left visible to
@@ -230,8 +249,9 @@ the caller instead of being hidden behind automatic retries.
 
 ### Pagination
 
-Every listing page exposes `page`, `page_count`, `total`, and a model-specific tuple
-such as `works`, `comments`, `bookmarks`, `series`, `collections`, or `pseuds`. Page
+Listing pages use 1-based page numbers and expose `page`, `page_count`, `total`, and
+a model-specific tuple such as `works`, `comments`, `bookmarks`, `series`,
+`collections`, or `pseuds`. Page
 objects support iteration and `len(page)`; index the contained tuple when random
 access is needed:
 
@@ -239,8 +259,10 @@ access is needed:
 tag = client.tag(TAG_NAME)
 page = tag.works_page
 
-first_work = page.works[0]
-print(len(page), page.total, first_work.title)
+print(len(page), page.total)
+
+if page:
+    print(page.works[0].title)
 
 for work in page:
     print(work.title)
@@ -249,9 +271,24 @@ if page.page < page.page_count:
     next_page = tag.copy(page=page.page + 1).works_page
 ```
 
-The page object itself is intentionally not sequence-indexable. `copy(page=...)`
-creates a clean handle with the same identity, options, and client without copying
-the original object's loaded state.
+The page object itself is not sequence-indexable. `copy(page=...)` keeps the same
+identity and client, preserves other options, and starts without loaded detail or
+listing caches. Some models also retain lightweight fields such as a known title,
+tag count, or pseud description. Omit `page` to keep the current page number.
+
+Use `copy(page=...)` instead of assigning to `page` on an object whose listings are
+already cached. A browse handle's page number applies to each of its independent
+listings; related browse handles start at page 1.
+
+AO3 also lists works and bookmarks on noncanonical tag profile pages. These lists
+are parsed independently, and tag redirects preserve the requested page.
+`Work.Page.total` and `Bookmark.Page.total` may be `None` when the page does not
+provide enough information to determine the total. Use `page_count` to traverse
+the available pages rather than calculating it from `total` or a fixed page size.
+
+For work and chapter comments, and work bookmarks, page 1 is cached on the handle.
+Calls to `comments_for_page(n)` or `bookmarks_for_page(n)` with `n != 1` make a new
+request each time; retain the returned page when you want to reuse it.
 
 ## Login
 
@@ -265,11 +302,7 @@ import os
 from ao3 import AO3Client
 
 with AO3Client(timeout=60) as client:
-    client.login(
-        os.environ["AO3_LOGIN"],
-        os.environ["AO3_PASSWORD"],
-        remember_me=False,
-    )
+    client.login(os.environ["AO3_LOGIN"], os.environ["AO3_PASSWORD"], remember_me=False)
 
     user = client.user("your_ao3_username")
 
@@ -280,6 +313,10 @@ with AO3Client(timeout=60) as client:
 
 The session cookies remain inside that client's `httpx` cookie jar. If AO3 redirects
 a protected request to the login page, `AO3AuthenticationError` is raised.
+Log in before creating the handles you intend to use for authenticated reads.
+Listings reflect the current account's visibility, including restricted works and
+the account's own private bookmarks where AO3 exposes them. `client.user(login)`
+selects an account to browse; it does not authenticate as that account.
 
 ## Authenticated actions
 
@@ -315,10 +352,7 @@ with AO3Client() as client:
     )
 
     bookmark.update(
-        notes="Finished reading.",
-        tags=["Finished"],
-        private=False,
-        recommended=True,
+        notes="Finished reading.", tags=["Finished"], private=False, recommended=True
     )
 
     bookmark.delete()
@@ -327,6 +361,11 @@ with AO3Client() as client:
 For `Bookmark.update()`, `None` leaves a field unchanged; an empty string or empty
 iterable clears text, tags, or collections. AO3 permits only one bookmark per user for
 the same item, so a second create is rejected with `AO3ActionError`.
+
+`tags` accepts a comma-separated string or an iterable of strings and `Tag` objects.
+`collections` accepts a comma-separated string or an iterable of collection names
+and `Collection` objects. `create_bookmark()` returns a `Bookmark`; `update()` returns
+the same bookmark with updated parsed data, and `delete()` returns `None`.
 
 AO3 exposes `POST /kudos` for creation and no `DELETE /kudos/:id` route or delete
 form override. Leaving Kudos is therefore one-way for both the sender and the work
@@ -354,6 +393,13 @@ reply.delete()
 chapter_comment = work.chapters[0].create_comment("I loved this chapter.")
 ```
 
+A `Work` created with a `chapter_id` also posts comments to that chapter, matching
+its chapter-scoped comment listing.
+
+`create_comment()` and `reply()` return a new `Comment` handle; accessing its content
+loads the comment permalink. `update()` returns the same comment with updated
+parsed data, and `delete()` returns `None`.
+
 When an account has multiple pseuds, pass `pseud_id` to `create_comment()`, `reply()`,
 or `update()`. Do not pass `name` or `email` for an authenticated comment.
 
@@ -363,9 +409,7 @@ logged in:
 
 ```python
 guest_comment = work.create_comment(
-    "A guest comment.",
-    name=GUEST_NAME,
-    email=GUEST_EMAIL,
+    "A guest comment.", name=GUEST_NAME, email=GUEST_EMAIL
 )
 ```
 
@@ -407,6 +451,9 @@ work.mark_as_read()
 ```
 
 Subscriptions and Marked for Later require an authenticated `AO3Client`.
+`unsubscribe()` and `Subscription.delete()` return `None` and raise `AO3ActionError`
+if AO3 does not expose an active subscription to remove. Subscription responses must
+include AO3's success confirmation; an unexpected response raises `AO3ParseError`.
 
 ## Browsing tags and languages
 
@@ -433,8 +480,8 @@ for bookmark in tag.bookmarks:
 ```
 
 `copy(page=...)` creates another lightweight handle carrying the same identity and
-client without copying loaded page state. It is available on `Tag`, `User`, `Pseud`,
-`Series`, `Collection`, `ExternalWork`, `Language`, and `Kudos`.
+client without copying loaded detail or listing caches. It is available on `Tag`,
+`User`, `Pseud`, `Series`, `Collection`, `ExternalWork`, `Language`, and `Kudos`.
 
 Languages are lightweight browse handles too. A work exposes both AO3's short code
 and display name:
@@ -449,6 +496,21 @@ if work_language:
 ```
 
 ## Works, chapters, comments, kudos, and downloads
+
+`client.work(WORK_ID)` loads all available chapters when `chapters` is accessed.
+To read a specific chapter, use `client.work(WORK_ID, CHAPTER_ID)` or a chapter URL:
+
+```python
+chapter_work = client.work(WORK_ID, CHAPTER_ID)
+chapter = chapter_work.chapters[0]
+print(chapter.position, chapter.content)
+print(chapter_work.comments_page.total)
+```
+
+On a chapter-specific handle, `chapters`, comment listings, and `create_comment()`
+are scoped to that chapter. Metadata statistics such as `words`, `comments_count`,
+and `number_of_posted_chapters` still describe the whole work. Bookmarks, Kudos,
+subscriptions, downloads, and Marked for Later also apply to the whole work.
 
 ```python
 work = client.work(id=WORK_ID)
@@ -597,6 +659,11 @@ for application code.
 Unless noted otherwise, a model accepts `client=AO3Client(...)`. Browse models also
 accept `page=1` and `view_adult=True`.
 
+`from_url()` constructors extract identity from the URL path. Query parameters and
+fragments do not configure the handle; pass `page` and `view_adult` explicitly where
+supported. Resource URLs use the selected client's origin rather than adopting the
+origin of the supplied URL.
+
 All supported application-level names can be imported from the package root:
 
 ```python
@@ -627,9 +694,10 @@ from ao3 import (
 
 ### `AO3Client`
 
+All constructor arguments are keyword-only.
+
 ```python
 AO3Client(
-    *,
     base_url="https://archiveofourown.org",
     cookies=None,
     headers=None,
@@ -647,6 +715,9 @@ AO3Client(
 | `close()` | Close the connection pool. |
 | `with AO3Client() as client` | Close the client automatically on context exit. |
 | `media_index` | Lazily parse and cache the top-level AO3 media index once per client. |
+
+Custom `headers` override the default headers case-insensitively, including
+`User-Agent` and `Accept`.
 
 Resource factories return unloaded handles bound to this client:
 
@@ -685,19 +756,24 @@ Create a work with `Work.from_id(work_id, chapter_id=None, ...)`,
 | --- | --- |
 | `comments_for_page(page)` | Load a specific `Comment.Page`. |
 | `bookmarks_for_page(page)` | Load a specific `Bookmark.Page`. |
-| `create_comment(content, *, pseud_id=None, name=None, email=None)` | Create a comment. `pseud_id` is an optional authenticated-pseud override; `name` and `email` are guest-only fields. |
-| `create_bookmark(*, notes="", tags=(), collections=(), private=False, recommended=False, pseud_id=None)` | Create the logged-in user's bookmark. Tag/collection items may be strings or model objects. |
-| `subscribe()` / `unsubscribe()` | Create or delete the current user's work subscription. |
+| `create_comment(content, *, pseud_id=None, name=None, email=None)` | Return a new `Comment` for this work or its selected chapter. `pseud_id` overrides the authenticated pseud; `name` and `email` are guest-only fields. |
+| `create_bookmark(*, notes="", tags=(), collections=(), private=False, recommended=False, pseud_id=None)` | Return the logged-in user's new `Bookmark`. Tag/collection arguments accept strings or iterables of strings and model objects. |
+| `subscribe()` / `unsubscribe()` | Return a `Subscription` when subscribing; return `None` when unsubscribing. |
 | `mark_for_later()` / `mark_as_read()` | Add to or remove from AO3's Marked for Later list; each returns the work. |
 | `download(file_type=...)` | Return `bytes` for keyword-only `file_type`: `azw3`, `epub`, `mobi`, `pdf`, or `html`. |
 
 When available, `download_links` is a `Work.DownloadLinks` object with absolute
-`azw3`, `epub`, `mobi`, `pdf`, and `html` URL attributes.
+`azw3`, `epub`, `mobi`, `pdf`, and `html` URL attributes. It is `None` when the parsed
+page does not expose all supported links; `download()` then raises `AO3ParseError`.
 
 ### `Chapter`
 
 Chapters are fully parsed objects returned by `work.chapters`; they are not separate
 metadata handles.
+
+Loading chapters also requests AO3's chapter navigation to resolve chapter IDs,
+positions, titles, and publication dates. `position` is 1-based within the work;
+`chapter.work` returns a new handle for the whole work.
 
 | Group | Members |
 | --- | --- |
@@ -715,20 +791,24 @@ Use `work.kudos` or `Kudos(work_id, *, page=1, view_adult=True, client=None)`.
 | `work_id`, `page`, `url`, `view_adult`, `client` | Identity and request context. |
 | `detail` | Cached parsed Kudos page used by the convenience properties below. |
 | `users`, `users_count`, `guest_count`, `total`, `page_count` | Paginated public Kudos data. |
-| `leave()` | Submit Kudos and invalidate this object's cached Kudos page. |
+| `leave()` | Submit Kudos, invalidate this object's cached Kudos page, and return the same `Kudos` object. |
 | `copy(page=...)` | Create a clean handle for another Kudos page. |
 
 ### `Tag` and `TagKind`
 
 Use `Tag(name, ...)`, `Tag.from_url(url, ...)`, or `client.tag(name, ...)`.
+`Tag.from_url()` accepts tag profile, work-list, and bookmark-list paths:
+`/tags/NAME`, `/tags/NAME/works`, and `/tags/NAME/bookmarks`. A tag handle exposes both
+listings regardless of which of these paths was supplied.
+
 `TagKind` is one of `rating`, `warning`, `category`, `fandom`, `relationship`,
 `character`, or `freeform`.
 
 | Member | Behavior |
 | --- | --- |
 | `name`, `kind`, `letter`, `link`, `url`, `page`, `view_adult`, `client` | Tag identity, optional classification/index letter, and request context. |
-| `works_page`, `works`, `works_count` | Public works carrying this tag. |
-| `bookmarks_page`, `bookmarks` | Public bookmarks carrying this tag. |
+| `works_page`, `works`, `works_count` | Works visible to the current session carrying this tag; `works_count` can be `None`. |
+| `bookmarks_page`, `bookmarks` | Visible bookmark listings carrying this tag; inspect `bookmarks_page.grouped` for the listing's count semantics. |
 | `copy(page=...)` | Create another lightweight page handle. |
 | `Tag.path(name, *, bookmarks=False)` | Build AO3's escaped work or bookmark path for a tag. |
 
@@ -740,7 +820,7 @@ Use `Language(short, name=None, ...)`, `Language.from_url(url, ...)`, or
 | Member | Behavior |
 | --- | --- |
 | `short`, `name`, `link`, `url`, `page`, `view_adult`, `client` | Language identity and request context. |
-| `works_page`, `works`, `works_count` | Public works in this language. |
+| `works_page`, `works`, `works_count` | Works visible to the current session in this language; `works_count` can be `None`. |
 | `copy(page=...)` | Create another lightweight page handle. |
 
 ### `Media`
@@ -779,10 +859,18 @@ Use `Pseud(name, user_login, ...)`, `Pseud.from_url(url, ...)`, or
 | Relationships | `user`, `works_page`, `works`, `series_page`, `series`, `bookmarks_page`, `bookmarks` |
 | Paging | `copy(page=...)` |
 
+`description`, `description_html`, `works_count`, and `recs_count` are optional
+summary fields. A directly constructed pseud can have `None` for these values;
+reading them does not load a profile. Loading `works_page` updates `works_count`.
+
 ### `Series`
 
 Use `Series(series_id, ...)`, `Series.from_url(url, ...)`, or
 `client.series(series_id, ...)`.
+
+`detail` and `works_page` are populated together from the series page. `position`
+is the work's part number when the series handle comes from `work.series`; it can
+be `None` on a directly constructed handle.
 
 | Group | Members |
 | --- | --- |
@@ -824,6 +912,10 @@ For `update()`, `None` preserves a field; empty text or an empty iterable clears
 corresponding value. `delete()` destroys that bookmark and its stored metadata; a new
 bookmark can be created later, but it is a new server-side record rather than an undo.
 
+AO3's abbreviated bookmark previews do not expose a bookmark ID. These objects
+have `id`, `link`, and `url` set to `None`, while retaining the visible bookmark
+metadata and target. An individual bookmark ID is required to update or delete it.
+
 ### `ExternalWork`
 
 Use `ExternalWork(external_work_id, ...)`, `ExternalWork.from_url(url, ...)`, or
@@ -836,6 +928,10 @@ Use `ExternalWork(external_work_id, ...)`, `ExternalWork.from_url(url, ...)`, or
 | External metadata | `url`, `title`, `author`, `summary`, `summary_html`, `language`, `created`; `url` is the off-site target. |
 | AO3 relationships | `tags`, `bookmarks_count`, `related_works_count`, `bookmarks_page`, `bookmarks` |
 | Paging | `copy(page=...)` |
+
+`tags` includes rating and category tags when shown. If a bookmark preview links
+only to the AO3 record, reading `url` fetches the external-work detail page to
+resolve the actual off-site destination.
 
 ### `Comment`
 
@@ -851,8 +947,11 @@ Use `Comment(comment_id, ...)`, `Comment.from_url(url, ...)`, or
 | Content/state | `content`, `content_html`, `deleted`, `unreviewed`, `spam`, `hidden` |
 | Mutation | `reply(content, *, pseud_id=None, name=None, email=None)`, `update(content, *, pseud_id=None)`, `delete()`; reply `name` and `email` are guest-only fields. |
 
-`created_at_text` and `edited_at_text` retain AO3's display value when it cannot be
-represented completely by a Python `datetime` or when the original wording matters.
+`created_at` and `edited_at` are naive `datetime` values or `None`; the SDK does not
+convert them to UTC. `timezone` retains the displayed posting-time zone abbreviation,
+and `created_at_text` / `edited_at_text` retain the full displayed timestamp when
+present. Date-only fields on other models use `datetime.date` or `None`.
+
 `delete()` is irreversible through AO3's user-facing routes; a deleted comment cannot
 be restored by this library.
 
@@ -881,15 +980,34 @@ be restored by this library.
 Each page has `page`, `page_count`, and `total`, implements iteration, and implements
 `len(page)`. Its item tuple supports normal indexing and slicing.
 
+| Field | Meaning |
+| --- | --- |
+| `page` | Current page reported by AO3, falling back to the requested page. |
+| `page_count` | Highest page number exposed by the page's pagination; defaults to 1 without pagination. |
+| `total` | Listing total, when known. `Work.Page` and `Bookmark.Page` allow `None`; other page types expose an integer. |
+| `len(page)` | Number of parsed items in this page's tuple, not the listing total. |
+
+`Comment.Page.comments` contains the page's top-level threads; nested replies are
+available through each comment's `replies`. Its `total` reflects the comment count
+displayed for the work or selected chapter, including replies, so it need not equal
+the number of top-level threads. Unavailable or unrevealed work entries may likewise
+contribute to a listing's total without producing a readable `Work` object.
+
+`Bookmark.Page.grouped` identifies AO3's **Bookmarked Items** listings. On these
+pages, `total` counts bookmarked targets, while `bookmarks` contains the individual
+bookmark previews shown under those targets. More bookmarks may be available on
+each target's own bookmark listing. Ordinary bookmark listings have `grouped=False`
+and `total` counts bookmarks.
+
 ### Exceptions
 
 | Exception | Meaning |
 | --- | --- |
 | `AO3Error` | Base class for library-defined errors. |
 | `AO3InvalidURLError` | A URL does not match the requested AO3 resource shape; also a `ValueError`. |
-| `AO3AuthenticationError` | AO3 redirected to login or rejected credentials. |
+| `AO3AuthenticationError` | AO3 redirected to login, returned a recognized login gate, or rejected credentials. |
 | `AO3ActionError` | AO3 rejected, forbids, or does not provide a requested write operation. |
-| `AO3ParseError` | Returned HTML lacks the structure required for that resource. |
+| `AO3ParseError` | Required page structure, resource identity, or an action's confirmation is missing or invalid. |
 
 HTTP status, connection, TLS, and timeout failures remain `httpx` exceptions.
 

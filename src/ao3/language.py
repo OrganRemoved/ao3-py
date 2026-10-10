@@ -27,7 +27,7 @@ class Language:
             if element is not None:
                 anchor = element.select_one("a[href*='/languages/']")
                 short = str(
-                    element.get("lang") or (anchor.get("lang") if anchor else "")
+                    element.get("lang") or (anchor.get("lang") if anchor else "") or ""
                 )
 
                 if (
@@ -112,7 +112,7 @@ class Language:
         return self.works_page.works
 
     @property
-    def works_count(self) -> int:
+    def works_count(self) -> int | None:
         return self.works_page.total
 
     def copy(self, *, page: int | None = None) -> "Language":

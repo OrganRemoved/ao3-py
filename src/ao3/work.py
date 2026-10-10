@@ -10,11 +10,7 @@ from bs4 import BeautifulSoup
 from bs4.element import Tag as Element
 
 from ao3.collection import Collection
-from ao3.exceptions import (
-    AO3AuthenticationError,
-    AO3InvalidURLError,
-    AO3ParseError,
-)
+from ao3.exceptions import AO3AuthenticationError, AO3InvalidURLError, AO3ParseError
 from ao3.language import Language
 from ao3.pseud import Pseud
 from ao3.series import Series
@@ -142,13 +138,13 @@ class Chapter:
     def url(self) -> str | None:
         return f"{self.client.base_url}{self.link}" if self.link else None
 
-    @cached_property
+    @property
     def work(self) -> "Work":
         return Work.from_id(
             self.work_id, view_adult=self.view_adult, client=self.client
         )
 
-    @cached_property
+    @property
     def pseuds(self) -> tuple[Pseud, ...]:
         return tuple(
             Pseud.from_reference(
@@ -317,16 +313,30 @@ class Kudos:
     def parse_page(content: bytes | str, requested_page: int) -> "Kudos.Data":
         soup = BeautifulSoup(content, "lxml")
 
-        if (container := soup.select_one("div#kudos")) is None or (
-            heading := soup.select_one("h2.heading")
-        ) is None:
+        heading = next(
+            (
+                element
+                for element in soup.select("h2.heading")
+                if re.search(
+                    r"\bUsers?\s+Who Left Kudos\b",
+                    element.get_text(" ", strip=True),
+                    re.IGNORECASE,
+                )
+            ),
+            None,
+        )
+        container = soup.select_one("div#kudos")
+
+        if heading is None:
             raise AO3ParseError("The AO3 kudos page was not found")
 
         users = tuple(
             User.Reference(
                 anchor.get_text(" ", strip=True), urlparse(str(anchor["href"])).path
             )
-            for anchor in container.select("p.kudos a[href^='/users/']")
+            for anchor in (
+                container.select("p.kudos a[href^='/users/']") if container else ()
+            )
         )
         pages = [
             int(element.get_text(strip=True))
@@ -415,7 +425,7 @@ class Work:
                 self,
                 page: int,
                 page_count: int,
-                total: int,
+                total: int | None,
                 works: "tuple[Work.Data, ...]",
             ) -> None:
                 self.page = page
@@ -426,7 +436,11 @@ class Work:
         __slots__ = ("page", "page_count", "total", "works")
 
         def __init__(
-            self, page: int, page_count: int, total: int, works: "tuple[Work, ...]"
+            self,
+            page: int,
+            page_count: int,
+            total: int | None,
+            works: "tuple[Work, ...]",
         ) -> None:
             self.page = page
             self.page_count = page_count
@@ -909,7 +923,7 @@ class Work:
             for chapter in parsed.chapters or ()
         )
 
-    @cached_property
+    @property
     def download_links(self) -> "Work.DownloadLinks | None":
         if links := self.detail.download_links:
             return Work.DownloadLinks(
@@ -1236,10 +1250,22 @@ class Work:
     @staticmethod
     def parse_index(content: bytes | str, requested_page: int) -> "Work.Page.Data":
         soup = BeautifulSoup(content, "lxml")
+        tag_profile = soup.select_one("div.tag.home.profile")
+        container = soup.select_one("div.tag.home.profile > div.work.listbox.group")
+        listing = (
+            container.select_one("ul.index.group")
+            if container is not None
+            else soup.select_one("ol.work.index.group, ul.work.index.group")
+        )
 
-        if (
-            listing := soup.select_one("ol.work.index.group, ul.work.index.group")
-        ) is None:
+        if listing is None:
+            if tag_profile and any(
+                "This tag has not been marked common" in element.get_text()
+                for element in tag_profile.select(":scope > p")
+            ):
+                return Work.Page.Data(
+                    requested_page, 1, 0 if requested_page == 1 else None, ()
+                )
             raise AO3ParseError("The AO3 work listing was not found")
 
         works = tuple(
@@ -1248,20 +1274,21 @@ class Work:
             if (work := Work.parse_blurb(article)) is not None
         )
 
+        pagination = container if container is not None else soup
         pages = [
             int(element.get_text(strip=True))
-            for element in soup.select(
+            for element in pagination.select(
                 "ol.pagination.actions a, ol.pagination.actions span, "
                 "div.pagination a, div.pagination em"
             )
             if element.get_text(strip=True).isdigit()
         ]
-        current = soup.select_one(
+        current = pagination.select_one(
             "ol.pagination.actions .current, "
             "ol.pagination.actions [aria-current=page], div.pagination .current"
         )
 
-        heading = listing.find_previous("h2", class_="heading")
+        heading = None if tag_profile else listing.find_previous("h2", class_="heading")
         total = re.search(
             r"(?P<count>[0-9][0-9,]*)\s+Works?\b",
             heading.get_text(" ", strip=True) if heading else "",
@@ -1273,7 +1300,11 @@ class Work:
             if current and current.get_text(strip=True).isdigit()
             else requested_page,
             max(pages, default=1),
-            int(total["count"].replace(",", "")) if total else len(works),
+            int(total["count"].replace(",", ""))
+            if total
+            else None
+            if max(pages, default=1) > 1
+            else len(listing.select(":scope > li[role=article]")),
             works,
         )
 
@@ -1288,10 +1319,7 @@ class Work:
             or (preface := soup.select_one("#workskin > .preface.group")) is None
             or (title_heading := preface.select_one("h2.title.heading")) is None
         ):
-            if (
-                soup.select_one("form#new_user, form.new_user")
-                or "registered users" in soup.get_text().lower()
-            ):
+            if soup.select_one("form#new_user, #loginform form.new_user"):
                 raise AO3AuthenticationError(f"Work {work_id} requires an AO3 login")
             raise AO3ParseError(f"Work metadata for {work_id} was not found")
 
@@ -1455,12 +1483,17 @@ class Work:
             chapter_summary = chapter.select_one(
                 "div.summary.module blockquote.userstuff"
             )
-            chapter_notes = chapter.select_one("div.notes.module blockquote.userstuff")
+            chapter_notes = chapter.select_one(
+                "div.notes.module:not(.end) blockquote.userstuff"
+            )
 
             if (
                 content := chapter.select_one("div.userstuff.module[role=article]")
             ) is None:
                 raise AO3ParseError(f"Chapter content for work {work_id} was not found")
+
+            if landmark := content.select_one(":scope > h3.landmark.heading#work"):
+                landmark.decompose()
 
             chapter_endnotes = chapter.select_one(
                 "div.end.notes.module blockquote.userstuff"

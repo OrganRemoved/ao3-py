@@ -24,33 +24,39 @@ class Bookmark:
 
     class Page:
         class Data:
-            __slots__ = ("bookmarks", "page", "page_count", "total")
+            __slots__ = ("bookmarks", "grouped", "page", "page_count", "total")
 
             def __init__(
                 self,
                 page: int,
                 page_count: int,
-                total: int,
+                total: int | None,
                 bookmarks: "tuple[Bookmark.Data, ...]",
+                *,
+                grouped: bool = False,
             ) -> None:
                 self.page = page
                 self.page_count = page_count
                 self.total = total
                 self.bookmarks = bookmarks
+                self.grouped = grouped
 
-        __slots__ = ("bookmarks", "page", "page_count", "total")
+        __slots__ = ("bookmarks", "grouped", "page", "page_count", "total")
 
         def __init__(
             self,
             page: int,
             page_count: int,
-            total: int,
+            total: int | None,
             bookmarks: "tuple[Bookmark, ...]",
+            *,
+            grouped: bool = False,
         ) -> None:
             self.page = page
             self.page_count = page_count
             self.total = total
             self.bookmarks = bookmarks
+            self.grouped = grouped
 
         def __iter__(self) -> "Iterator[Bookmark]":
             return iter(self.bookmarks)
@@ -153,7 +159,7 @@ class Bookmark:
 
         return self.client.fetch_bookmark(self)
 
-    @cached_property
+    @property
     def pseud(self) -> Pseud:
         return Pseud.from_reference(
             self.detail.pseud, view_adult=self.view_adult, client=self.client
@@ -163,7 +169,7 @@ class Bookmark:
     def created(self) -> date | None:
         return self.detail.created
 
-    @cached_property
+    @property
     def tags(self) -> tuple[Tag, ...]:
         return tuple(
             Tag.from_reference(
@@ -172,7 +178,7 @@ class Bookmark:
             for reference in self.detail.tags
         )
 
-    @cached_property
+    @property
     def collections(self) -> tuple[Collection, ...]:
         return tuple(
             Collection.from_reference(
@@ -197,7 +203,7 @@ class Bookmark:
     def private(self) -> bool:
         return self.detail.private
 
-    @cached_property
+    @property
     def bookmarkable(self) -> "Work | Series | ExternalWork | None":
         from ao3.series import Series
         from ao3.work import Work
@@ -254,6 +260,29 @@ class Bookmark:
 
     def __repr__(self) -> str:
         return f"Bookmark(id={self.id!r})"
+
+    @staticmethod
+    def _parse_bookmarkable(article: BeautifulSoup) -> object | None:
+        if str(article.get("id", "")).startswith("external_work_"):
+            return ExternalWork.parse_blurb(article)
+
+        heading = article.select_one("div.header.module h4.heading")
+        title = heading.select_one("a[href]") if heading else None
+        if title is None:
+            return None
+
+        path = urlparse(str(title["href"])).path
+        if re.search(r"/works/[0-9]+(?:/|$)", path):
+            from ao3.work import Work
+
+            return Work.parse_blurb(article)
+        if re.search(r"/series/[0-9]+(?:/|$)", path):
+            from ao3.series import Series
+
+            return Series.parse_blurb(article)
+        if re.search(r"/external_works/[0-9]+(?:/|$)", path):
+            return ExternalWork.parse_blurb(article)
+        return None
 
     @staticmethod
     def parse_blurb(article: BeautifulSoup) -> "Bookmark.Data | None":
@@ -335,21 +364,7 @@ class Bookmark:
             ]
             notes_text = "\n".join(line for line in lines if line) or None
 
-        bookmarkable = None
-
-        if article.select_one("a[href*='/works/']"):
-            from ao3.work import Work
-
-            bookmarkable = Work.parse_blurb(article)
-        elif article.select_one("a[href*='/series/']"):
-            from ao3.series import Series
-
-            bookmarkable = Series.parse_blurb(article)
-        elif (
-            article.select_one("a[href*='/external_works/']")
-            or str(article.get("class", "")).find("external-work") >= 0
-        ):
-            bookmarkable = ExternalWork.parse_blurb(article)
+        bookmarkable = Bookmark._parse_bookmarkable(article)
 
         classes = {str(value) for value in article.get("class", [])}
         status = article.select_one("p.status")
@@ -366,7 +381,7 @@ class Bookmark:
             notes_html,
             "rec" in classes
             or "recommend" in status_text
-            or bool(status and status.select_one("span.recommended")),
+            or bool(status and status.select_one("span.rec, span.recommended")),
             "private" in classes
             or "private" in status_text
             or bool(status and status.select_one("span.private")),
@@ -376,36 +391,61 @@ class Bookmark:
     @staticmethod
     def parse_index(content: bytes | str, requested_page: int) -> "Bookmark.Page.Data":
         soup = BeautifulSoup(content, "lxml")
-
-        if (
-            listing := soup.select_one(
-                "ol.bookmark.index.group, ul.bookmark.index.group"
-            )
-        ) is None:
-            raise AO3ParseError("The AO3 bookmark index was not found")
-
-        bookmarks = tuple(
-            parsed
-            for article in listing.select(":scope > li[role=article]")
-            if (parsed := Bookmark.parse_blurb(article)) is not None
+        tag_profile = soup.select_one("div.tag.home.profile")
+        container = soup.select_one("div.tag.home.profile > div.bookmark.listbox.group")
+        listing = (
+            container.select_one("ul.index.group")
+            if container is not None
+            else soup.select_one("ol.bookmark.index.group, ul.bookmark.index.group")
         )
 
+        if listing is None:
+            if tag_profile and any(
+                "This tag has not been marked common" in element.get_text()
+                for element in tag_profile.select(":scope > p")
+            ):
+                return Bookmark.Page.Data(
+                    requested_page, 1, 0 if requested_page == 1 else None, ()
+                )
+            raise AO3ParseError("The AO3 bookmark index was not found")
+
+        bookmarks = []
+        shared_target = None
+        grouped = False
+        for article in listing.select(":scope > li[role=article]"):
+            if recent := article.select_one(
+                ":scope > div.recent > ul.bookmark.index.group"
+            ):
+                grouped = True
+                target = Bookmark._parse_bookmarkable(article)
+                for preview in recent.select(":scope > li[role=article]"):
+                    if (parsed := Bookmark.parse_blurb(preview)) is not None:
+                        parsed.bookmarkable = target
+                        bookmarks.append(parsed)
+            elif (parsed := Bookmark.parse_blurb(article)) is not None:
+                if "short" in article.get("class", []):
+                    parsed.bookmarkable = shared_target
+                bookmarks.append(parsed)
+            else:
+                shared_target = Bookmark._parse_bookmarkable(article)
+
+        pagination = container if container is not None else soup
         pages = [
             int(element.get_text(strip=True))
-            for element in soup.select(
+            for element in pagination.select(
                 "ol.pagination.actions a, ol.pagination.actions span, "
                 "div.pagination a, div.pagination em"
             )
             if element.get_text(strip=True).isdigit()
         ]
-        current = soup.select_one(
+        current = pagination.select_one(
             "ol.pagination.actions .current, "
             "ol.pagination.actions [aria-current=page], div.pagination .current"
         )
 
-        heading = soup.select_one("h2.heading")
+        heading = None if tag_profile else listing.find_previous("h2", class_="heading")
         total_match = re.search(
-            r"(?P<count>[0-9][0-9,]*)\s+Bookmarks?\b",
+            r"(?P<count>[0-9][0-9,]*)\s+(?P<kind>Bookmarks?|Bookmarked Items?)\b",
             heading.get_text(" ", strip=True) if heading else "",
             re.IGNORECASE,
         )
@@ -417,8 +457,14 @@ class Bookmark:
             max(pages, default=1),
             int(total_match["count"].replace(",", ""))
             if total_match
+            else None
+            if max(pages, default=1) > 1
             else len(bookmarks),
-            bookmarks,
+            tuple(bookmarks),
+            grouped=grouped
+            or bool(
+                total_match and total_match["kind"].lower().startswith("bookmarked")
+            ),
         )
 
     @staticmethod

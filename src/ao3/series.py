@@ -343,6 +343,8 @@ class Series:
 
     @staticmethod
     def parse_blurb(article: BeautifulSoup) -> "Series.Data | None":
+        from ao3.work import Work
+
         if (
             (heading := article.select_one("div.header.module h4.heading")) is None
             or (title_link := heading.select_one("a[href*='/series/']")) is None
@@ -398,7 +400,7 @@ class Series:
             tuple(pseuds),
             None,
             updated,
-            summary.get_text(" ", strip=True) or None if summary else None,
+            Work.user_text(summary),
             summary_html,
             None,
             None,
@@ -467,7 +469,7 @@ class Series:
         if (meta := soup.select_one("dl.series.meta.group")) is None or (
             title_heading := soup.select_one("h2.heading")
         ) is None:
-            if soup.select_one("form#new_user, form.new_user"):
+            if soup.select_one("form#new_user, #loginform form.new_user"):
                 raise AO3AuthenticationError(
                     f"Series {series_id} requires an AO3 login"
                 )

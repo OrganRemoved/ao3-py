@@ -195,16 +195,11 @@ class Pseud:
             else self.name
         )
 
-    @cached_property
+    @property
     def user(self) -> "User":
         from ao3.user import User
 
-        return User(
-            self.user_login,
-            page=self.page,
-            view_adult=self.view_adult,
-            client=self.client,
-        )
+        return User(self.user_login, view_adult=self.view_adult, client=self.client)
 
     @cached_property
     def works_page(self) -> "Work.Page":
@@ -251,10 +246,12 @@ class Pseud:
 
     @staticmethod
     def parse_index(content: bytes | str, requested_page: int) -> "Pseud.Page.Data":
+        from ao3.work import Work
+
         soup = BeautifulSoup(content, "lxml")
         listing = soup.select("li.user.pseud.picture.blurb.group[role=article]")
 
-        if not listing and not soup.select_one("h2.heading"):
+        if not listing and soup.select_one("ul.pseud.index.group") is None:
             raise AO3ParseError("The AO3 pseud index was not found")
 
         pages = [
@@ -293,7 +290,7 @@ class Pseud:
                     "".join(str(child) for child in description.contents).strip()
                     or None
                 )
-                reference.description = description.get_text(" ", strip=True) or None
+                reference.description = Work.user_text(description)
 
             counts = item.select_one("div.header.module h5.heading")
             counts_text = counts.get_text(" ", strip=True) if counts else ""

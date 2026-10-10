@@ -1,0 +1,115 @@
+name: Bug report
+description: Report an ao3-py bug with the affected page and a reproducible example.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Include the AO3 page and SDK operation that trigger the problem.
+        Remove passwords, cookies, tokens, and private content from code, logs, and HTML before posting.
+
+  - type: input
+    id: page-url
+    attributes:
+      label: AO3 page URL
+      description: Include pagination and filter parameters. If AO3 redirects, also include the final URL. For a bug unrelated to a page, enter "Not applicable".
+      placeholder: https://archiveofourown.org/tags/Example/works?page=2
+    validations:
+      required: true
+
+  - type: dropdown
+    id: page-type
+    attributes:
+      label: Page type
+      options:
+        - Work or chapter
+        - Work listing, search, tag, or language
+        - Bookmark or bookmark listing
+        - Series
+        - User or pseud
+        - Collection
+        - Media or fandom index
+        - Comment or kudos
+        - Login, subscription, or another account action
+        - Other / not applicable
+    validations:
+      required: true
+
+  - type: dropdown
+    id: login-state
+    attributes:
+      label: SDK login state
+      description: Describe the SDK session when the bug occurs, even if your browser is logged in separately.
+      options:
+        - Logged out
+        - Logged in
+        - Reproduces both logged in and logged out
+        - Not sure / not applicable
+    validations:
+      required: true
+
+  - type: input
+    id: sdk-version
+    attributes:
+      label: ao3-py version
+      description: Run `python -m pip show ao3-py`, or provide the commit hash if installed from Git.
+      placeholder: "2026.10.10"
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Python version and operating system
+      placeholder: Python 3.12.5 on Windows 11
+    validations:
+      required: true
+
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+      description: Describe what you expected and what happened. For parsing bugs, identify the incorrect or missing field and its value.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps or minimal code
+      description: Include the SDK class, method, or property involved, along with relevant client settings. Use placeholders for credentials and proxy credentials.
+      placeholder: |
+        1. Create an AO3Client with ...
+        2. Load the URL above using ...
+        3. Access ...
+
+        Paste the smallest code example that reproduces the problem here.
+    validations:
+      required: true
+
+  - type: textarea
+    id: traceback
+    attributes:
+      label: Traceback or incorrect output
+      description: Paste the full traceback, HTTP status code, or unexpected output as text. Remove sensitive data first.
+      render: text
+
+  - type: dropdown
+    id: browser-result
+    attributes:
+      label: Browser check and retry result
+      description: Try the same URL in a browser with the same login state. AO3 can return temporary SSL errors (such as HTTP 525) or timeouts; refresh or retry and report the result.
+      options:
+        - The browser page loads, but the SDK still fails after retrying
+        - Both the browser and SDK fail after retrying
+        - The problem disappears after refreshing or retrying
+        - The problem is intermittent
+        - Not checked / not applicable
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Relevant HTML, screenshots, or additional context
+      description: If useful, include a small sanitized HTML fragment or screenshot around the affected element. Mention proxy use, a custom AO3 origin, or a site skin if relevant. Do not attach a full authenticated page or browser profile.
