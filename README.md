@@ -5,7 +5,7 @@ An unofficial, typed, synchronous Python SDK for
 
 `ao3-py` turns AO3 pages into lazy domain objects. Constructing a `Work`, `Tag`,
 `User`, or another model creates only a lightweight handle. The first property that
-needs remote data loads it through `httpx`, and the parsed state is then cached on
+needs remote data loads it through `httpx2`, and the parsed state is then cached on
 that object. The SDK reads AO3's HTML pages and submits its forms for supported
 actions.
 
@@ -234,16 +234,16 @@ with AO3Client(
     print(work.title)
 ```
 
-`cookies` accepts a dictionary or `httpx.Cookies`; omit it for a new anonymous
-session. `transport` accepts a synchronous `httpx.BaseTransport`, including an
-`httpx.MockTransport` for offline applications or tests.
+`cookies` accepts a dictionary or `httpx2.Cookies`; omit it for a new anonymous
+session. `transport` accepts a synchronous `httpx2.BaseTransport`, including an
+`httpx2.MockTransport` for offline applications or tests.
 
 Model URLs and relative download links are resolved against the owning client's
 current `base_url`. Absolute download URLs retain the host supplied by AO3.
 Changing `base_url`, cookies, or login state does not clear existing model caches;
 create new handles when changing the session or origin.
 
-The built-in client uses a Chrome user agent and enables HTTP/2. `httpx` negotiates
+The built-in client uses a Chrome user agent and enables HTTP/2. `httpx2` negotiates
 HTTP/1.1 when HTTP/2 is unavailable. Transport errors and timeouts are left visible to
 the caller instead of being hidden behind automatic retries.
 
@@ -311,7 +311,7 @@ with AO3Client(timeout=60) as client:
     print(user.works_page.total)
 ```
 
-The session cookies remain inside that client's `httpx` cookie jar. If AO3 redirects
+The session cookies remain inside that client's `httpx2` cookie jar. If AO3 redirects
 a protected request to the login page, `AO3AuthenticationError` is raised.
 Log in before creating the handles you intend to use for authenticated reads.
 Listings reflect the current account's visibility, including restricted works and
@@ -708,7 +708,7 @@ AO3Client(
 
 | Member | Behavior |
 | --- | --- |
-| `http` | The underlying synchronous `httpx.Client` and its cookie jar. |
+| `http` | The underlying synchronous `httpx2.Client` and its cookie jar. |
 | `base_url` | Read/write origin used to resolve model and download URLs. |
 | `get(url, **kwargs)` / `post(url, **kwargs)` | Perform an HTTP request, raise for non-success status, and detect redirects to AO3 login. |
 | `login(login, password, *, remember_me=False)` | Authenticate the current cookie session and return the client. `login` accepts an AO3 username or email address. |
@@ -1009,7 +1009,19 @@ and `total` counts bookmarks.
 | `AO3ActionError` | AO3 rejected, forbids, or does not provide a requested write operation. |
 | `AO3ParseError` | Required page structure, resource identity, or an action's confirmation is missing or invalid. |
 
-HTTP status, connection, TLS, and timeout failures remain `httpx` exceptions.
+HTTP status, connection, TLS, and timeout failures propagate as `httpx2` exceptions:
+
+| Exception | Meaning |
+| --- | --- |
+| `httpx2.HTTPStatusError` | `raise_for_status()` rejected a non-success response. |
+| `httpx2.RequestError` | A request failed, including timeouts (`TimeoutException`), connection or TLS errors (`ConnectError`), and protocol errors (`RemoteProtocolError`). |
+
+Catch `httpx2.HTTPError` to handle both categories. When migrating from `httpx`,
+update exception imports and handlers to `httpx2`; the old exception classes do
+not catch the new ones. The `AO3*` exception classes are unchanged.
+
+`httpx2.InvalidURL`, `httpx2.CookieConflict`, and `httpx2.StreamError` are outside
+the `HTTPError` hierarchy and require separate handlers when relevant.
 
 ## Adult content
 
@@ -1027,7 +1039,7 @@ visibility, or collection restrictions.
 ## Network and parsing behavior
 
 ```python
-import httpx
+import httpx2
 
 from ao3 import (
     AO3ActionError,
@@ -1048,7 +1060,7 @@ except AO3ActionError as error:
     print(f"AO3 rejected or does not support the action: {error}")
 except AO3ParseError:
     print("AO3 returned a page shape that this version could not parse")
-except httpx.HTTPError as error:
+except httpx2.HTTPError as error:
     print(f"The HTTP request failed: {error}")
 ```
 

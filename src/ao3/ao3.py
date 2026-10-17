@@ -3,13 +3,19 @@ from collections.abc import Iterable, Mapping
 from functools import cache, cached_property
 from typing import Any, Literal, overload
 
-import httpx
+import httpx2
 from bs4 import BeautifulSoup
+from bs4.element import Tag as Element
 
 from ao3.bookmark import Bookmark
 from ao3.collection import Collection
 from ao3.comment import Comment
-from ao3.exceptions import AO3ActionError, AO3AuthenticationError, AO3ParseError
+from ao3.exceptions import (
+    AO3ActionError,
+    AO3AuthenticationError,
+    AO3CSRFError,
+    AO3ParseError,
+)
 from ao3.external_work import ExternalWork
 from ao3.language import Language
 from ao3.media import Media
@@ -22,7 +28,7 @@ from ao3.work import Chapter, Kudos, Work
 
 
 class AO3Client:
-    """HTTPX connection pool and AO3 page-loading operations."""
+    """HTTPX2 connection pool and AO3 page-loading operations."""
 
     @classmethod
     @cache
@@ -33,12 +39,12 @@ class AO3Client:
         self,
         *,
         base_url: str = "https://archiveofourown.org",
-        cookies: Mapping[str, str] | httpx.Cookies | None = None,
+        cookies: Mapping[str, str] | httpx2.Cookies | None = None,
         headers: Mapping[str, str] | None = None,
-        timeout: float | httpx.Timeout = 30,
-        transport: httpx.BaseTransport | None = None,
+        timeout: float | httpx2.Timeout = 30,
+        transport: httpx2.BaseTransport | None = None,
     ) -> None:
-        request_headers = httpx.Headers(
+        request_headers = httpx2.Headers(
             {
                 "Accept": "text/html,application/xhtml+xml",
                 "User-Agent": (
@@ -49,7 +55,7 @@ class AO3Client:
             }
         )
         request_headers.update(headers or {})
-        self.http = httpx.Client(
+        self.http = httpx2.Client(
             base_url=base_url,
             cookies=cookies,
             follow_redirects=True,
@@ -67,29 +73,143 @@ class AO3Client:
     def base_url(self, value: str) -> None:
         self.http.base_url = value
 
-    def get(self, url: str, **kwargs: Any) -> httpx.Response:
-        response = self.http.get(url, **kwargs)
+    def get(self, url: str, **kwargs: Any) -> httpx2.Response:
+        return self._check_response(self.http.get(url, **kwargs))
+
+    def post(self, url: str, **kwargs: Any) -> httpx2.Response:
+        return self._check_response(self.http.post(url, **kwargs))
+
+    @staticmethod
+    def _check_response(
+        response: httpx2.Response, *, login_page: bool = False
+    ) -> httpx2.Response:
+        if response.url.path.rstrip("/") == "/auth_error":
+            raise AO3CSRFError("AO3 rejected the form's authenticity token")
+
+        if response.status_code == 422:
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
+
+            if (
+                isinstance(payload, dict)
+                and isinstance(errors := payload.get("errors"), dict)
+                and "auth_error" in errors
+            ):
+                raise AO3CSRFError("AO3 rejected the form's authenticity token")
+
+            if (
+                isinstance(payload, dict)
+                and isinstance(errors := payload.get("errors"), list)
+                and errors
+                and all(isinstance(error, str) for error in errors)
+            ):
+                raise AO3ActionError(" ".join(errors))
+
         response.raise_for_status()
 
-        if response.url.path.rstrip("/") == "/users/login":
+        if not login_page and response.url.path.rstrip("/") == "/users/login":
             raise AO3AuthenticationError("This AO3 resource requires a login")
 
         return response
 
-    def post(self, url: str, **kwargs: Any) -> httpx.Response:
-        response = self.http.post(url, **kwargs)
-        response.raise_for_status()
+    def _csrf_token(self) -> str:
+        response = self.get(
+            "/token_dispenser.json",
+            headers={"Accept": "application/json", "Cache-Control": "no-cache"},
+        )
+        try:
+            payload = response.json()
+        except ValueError as error:
+            raise AO3ParseError("AO3 did not return an authenticity token") from error
 
-        if response.url.path.rstrip("/") == "/users/login":
-            raise AO3AuthenticationError("This AO3 resource requires a login")
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(token := payload.get("token"), str)
+            or not token.strip()
+        ):
+            raise AO3ParseError("AO3 did not return an authenticity token")
 
-        return response
+        return token
+
+    def _same_origin(self, url: httpx2.URL) -> bool:
+        origin = self.http.base_url
+        return (url.scheme, url.host, url.port) == (
+            origin.scheme,
+            origin.host,
+            origin.port,
+        )
+
+    def _follow_redirects(self, response: httpx2.Response) -> httpx2.Response:
+        history = []
+        while response.next_request is not None:
+            if len(history) >= self.http.max_redirects:
+                raise httpx2.TooManyRedirects(
+                    "Exceeded maximum allowed redirects", request=response.request
+                )
+            request = response.next_request
+            if not self._same_origin(request.url):
+                raise AO3ActionError(
+                    "AO3 form redirects must stay on the client origin"
+                )
+            history.append(response)
+            response = self.http.send(request, follow_redirects=False)
+        response.history = history
+        return self._check_response(response)
+
+    def _submit_form(
+        self,
+        page: httpx2.Response,
+        form: Element,
+        data: Mapping[str, str],
+        *,
+        headers: Mapping[str, str] | None = None,
+        follow_redirects: bool = True,
+    ) -> httpx2.Response:
+        action = page.url.join(str(form["action"]))
+        if not self._same_origin(page.url) or not self._same_origin(action):
+            raise AO3ActionError("AO3 form submissions must stay on the client origin")
+
+        fields = dict(data)
+        document = form.find_parent("html") or form
+        if document.select_one("#small_login") or not fields.get("authenticity_token"):
+            fields["authenticity_token"] = self._csrf_token()
+
+        request_headers = {"Referer": str(page.url), **(headers or {})}
+        retried = False
+        while True:
+            response = self.http.post(
+                action, data=fields, headers=request_headers, follow_redirects=False
+            )
+            try:
+                if response.next_request is not None:
+                    target = response.next_request.url
+                    if not self._same_origin(target):
+                        raise AO3ActionError(
+                            "AO3 form redirects must stay on the client origin"
+                        )
+                    if target.path.rstrip("/") == "/auth_error":
+                        raise AO3CSRFError("AO3 rejected the form's authenticity token")
+                else:
+                    self._check_response(response)
+            except AO3CSRFError:
+                if retried:
+                    raise
+                # Rails rejects CSRF before running the action. Other failures,
+                # especially timeouts, must not replay a potentially saved write.
+                fields["authenticity_token"] = self._csrf_token()
+                retried = True
+                continue
+
+            return self._follow_redirects(response) if follow_redirects else response
 
     def login(
         self, login: str, password: str, *, remember_me: bool = False
     ) -> "AO3Client":
-        response = self.http.get("/users/login", follow_redirects=True)
-        response.raise_for_status()
+        response = self._check_response(
+            self.http.get("/users/login", follow_redirects=True), login_page=True
+        )
 
         if (
             form := BeautifulSoup(response.content, "lxml").select_one(
@@ -105,11 +225,9 @@ class AO3Client:
         data["user[login]"] = login
         data["user[password]"] = password
         data["user[remember_me]"] = "1" if remember_me else "0"
-        response = self.http.post(str(form["action"]), data=data, follow_redirects=True)
-        response.raise_for_status()
-
-        if response.url.path.rstrip("/") == "/users/login":
-            raise AO3AuthenticationError("AO3 rejected the login credentials")
+        response = self._submit_form(response, form, data)
+        if BeautifulSoup(response.content, "lxml").select_one("body.logged-in") is None:
+            raise AO3AuthenticationError("AO3 did not confirm a successful login")
 
         return self
 
@@ -396,9 +514,23 @@ class AO3Client:
 
         data["comment[comment_content]"] = content
 
-        response = self.post(
-            str(form["action"]), data=data, headers={"Referer": str(page.url)}
-        )
+        response = self._submit_form(page, form, data, follow_redirects=False)
+
+        # The new-comment form redirects directly to the saved comment. A guest
+        # cannot open that page while it is awaiting moderation, but the write
+        # has already succeeded. Return the usual lazy Comment without a GET.
+        if (
+            response.status_code in {302, 303}
+            and response.next_request is not None
+            and (
+                match := re.fullmatch(
+                    r"/comments/(?P<comment_id>[0-9]+)", response.next_request.url.path
+                )
+            )
+        ):
+            return Comment(int(match["comment_id"]), client=self)
+
+        response = self._follow_redirects(response)
 
         soup = BeautifulSoup(response.content, "lxml")
 
@@ -464,13 +596,13 @@ class AO3Client:
                 f"{kudos.work_id}"
             )
 
-        response = self.post(
-            str(form["action"]),
+        response = self._submit_form(
+            page,
+            form,
             data={
                 str(element["name"]): str(element.get("value", ""))
                 for element in form.select("input[type=hidden][name]")
             },
-            headers={"Referer": str(page.url)},
         )
 
         soup = BeautifulSoup(response.content, "lxml")
@@ -566,9 +698,7 @@ class AO3Client:
             }
         )
 
-        response = self.post(
-            str(form["action"]), data=data, headers={"Referer": str(page.url)}
-        )
+        response = self._submit_form(page, form, data)
 
         soup = BeautifulSoup(response.content, "lxml")
 
@@ -824,9 +954,7 @@ class AO3Client:
 
         data["comment[comment_content]"] = content
 
-        response = self.post(
-            str(form["action"]), data=data, headers={"Referer": str(page.url)}
-        )
+        response = self._submit_form(page, form, data)
 
         soup = BeautifulSoup(response.content, "lxml")
 
@@ -856,13 +984,13 @@ class AO3Client:
                 f"AO3 did not allow this session to delete Comment {comment.id}"
             )
 
-        response = self.post(
-            str(form["action"]),
+        response = self._submit_form(
+            page,
+            form,
             data={
                 str(element["name"]): str(element.get("value", ""))
                 for element in form.select("input[type=hidden][name]")
             },
-            headers={"Referer": str(page.url)},
         )
 
         soup = BeautifulSoup(response.content, "lxml")
@@ -928,13 +1056,14 @@ class AO3Client:
                 client=self,
             )
 
-        response = self.post(
-            str(form["action"]),
+        response = self._submit_form(
+            page,
+            form,
             data={
                 str(element["name"]): str(element.get("value", ""))
                 for element in form.select("input[type=hidden][name]")
             },
-            headers={"Accept": "application/json", "Referer": str(page.url)},
+            headers={"Accept": "application/json"},
         )
         try:
             payload = response.json()
@@ -993,13 +1122,19 @@ class AO3Client:
                 f"This session is not subscribed to {subscribable_type}"
             )
 
-        response = self.post(
-            str(form["action"]),
+        if isinstance(subscription, Subscription) and (
+            httpx2.URL(str(form["action"])).path != httpx2.URL(subscription.link).path
+        ):
+            raise AO3ActionError("This subscription has been replaced or removed")
+
+        response = self._submit_form(
+            page,
+            form,
             data={
                 str(element["name"]): str(element.get("value", ""))
                 for element in form.select("input[type=hidden][name]")
             },
-            headers={"Accept": "application/json", "Referer": str(page.url)},
+            headers={"Accept": "application/json"},
         )
 
         try:
@@ -1024,13 +1159,13 @@ class AO3Client:
                 f"AO3 did not offer the mark_for_later action for Work {work.id}"
             )
 
-        response = self.post(
-            str(form["action"]),
+        response = self._submit_form(
+            page,
+            form,
             data={
                 str(element["name"]): str(element.get("value", ""))
                 for element in form.select("input[type=hidden][name]")
             },
-            headers={"Referer": str(page.url)},
         )
 
         soup = BeautifulSoup(response.content, "lxml")
@@ -1057,13 +1192,13 @@ class AO3Client:
                 f"AO3 did not offer the mark_as_read action for Work {work.id}"
             )
 
-        response = self.post(
-            str(form["action"]),
+        response = self._submit_form(
+            page,
+            form,
             data={
                 str(element["name"]): str(element.get("value", ""))
                 for element in form.select("input[type=hidden][name]")
             },
-            headers={"Referer": str(page.url)},
         )
 
         soup = BeautifulSoup(response.content, "lxml")
@@ -1149,9 +1284,7 @@ class AO3Client:
         if recommended is not None:
             data["bookmark[rec]"] = "1" if recommended else "0"
 
-        response = self.post(
-            str(form["action"]), data=data, headers={"Referer": str(page.url)}
-        )
+        response = self._submit_form(page, form, data)
 
         soup = BeautifulSoup(response.content, "lxml")
 
@@ -1178,13 +1311,13 @@ class AO3Client:
                 f"AO3 did not allow this session to delete Bookmark {bookmark.id}"
             )
 
-        response = self.post(
-            str(form["action"]),
+        response = self._submit_form(
+            page,
+            form,
             data={
                 str(element["name"]): str(element.get("value", ""))
                 for element in form.select("input[type=hidden][name]")
             },
-            headers={"Referer": str(page.url)},
         )
 
         soup = BeautifulSoup(response.content, "lxml")

@@ -304,13 +304,16 @@ class Comment:
         else:
             heading_copy = BeautifulSoup(str(heading), "lxml")
             for element in heading_copy.select(
-                "span.parent, span.datetime, span.status"
+                "span.parent, span.datetime, span.status, span.role"
             ):
                 element.extract()
 
             pseud_reference = None
             guest_name = heading_copy.get_text(" ", strip=True) or None
-            by_anonymous_creator = guest_name == "Anonymous Creator"
+            by_anonymous_creator = (
+                guest_name == "Anonymous Creator"
+                and heading.select_one("span.role") is None
+            )
             guest_name = None if by_anonymous_creator else guest_name
 
         created_element = (

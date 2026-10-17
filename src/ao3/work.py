@@ -10,7 +10,12 @@ from bs4 import BeautifulSoup
 from bs4.element import Tag as Element
 
 from ao3.collection import Collection
-from ao3.exceptions import AO3AuthenticationError, AO3InvalidURLError, AO3ParseError
+from ao3.exceptions import (
+    AO3ActionError,
+    AO3AuthenticationError,
+    AO3InvalidURLError,
+    AO3ParseError,
+)
 from ao3.language import Language
 from ao3.pseud import Pseud
 from ao3.series import Series
@@ -1023,10 +1028,52 @@ class Work:
     def download(
         self, *, file_type: Literal["azw3", "epub", "mobi", "pdf", "html"]
     ) -> bytes:
+        if file_type not in {"azw3", "epub", "mobi", "pdf", "html"}:
+            raise ValueError(f"Unsupported AO3 download format: {file_type}")
+
         if not (links := self.download_links):
             raise AO3ParseError(f"Work {self.id} does not expose download links")
 
-        return self.client.get(getattr(links, file_type)).content
+        response = self.client.get(getattr(links, file_type))
+        if not re.fullmatch(
+            rf"/downloads/{self.id}/[^/]+\.{file_type}", response.url.path
+        ):
+            soup = BeautifulSoup(response.content, "lxml")
+            if error := soup.select_one("div.flash.error"):
+                raise AO3ActionError(error.get_text(" ", strip=True))
+            raise AO3ParseError(
+                f"AO3 did not return the {file_type} download for Work {self.id}"
+            )
+
+        if not response.content:
+            raise AO3ParseError(f"AO3 returned an empty download for Work {self.id}")
+
+        content_type = (
+            response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        )
+        if file_type == "html":
+            soup = BeautifulSoup(response.content, "lxml")
+            if (
+                soup.select_one("#preface") is None
+                or soup.select_one("#chapters.userstuff") is None
+            ):
+                raise AO3ParseError(
+                    f"AO3 did not return an HTML download for Work {self.id}"
+                )
+        elif content_type in {
+            "text/html",
+            "application/xhtml+xml",
+            "application/json",
+        } or re.match(
+            rb"\s*(?:<!doctype\s+html|<html\b|<head\b|<body\b)",
+            response.content[:512].removeprefix(b"\xef\xbb\xbf"),
+            re.IGNORECASE,
+        ):
+            raise AO3ParseError(
+                f"AO3 returned a page instead of the {file_type} download for Work {self.id}"
+            )
+
+        return response.content
 
     def __repr__(self) -> str:
         title = (

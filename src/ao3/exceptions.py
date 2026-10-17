@@ -10,8 +10,12 @@ class AO3AuthenticationError(AO3Error):
     """The requested resource requires an authenticated AO3 session."""
 
 
+class AO3CSRFError(AO3AuthenticationError):
+    """AO3 rejected the form's authenticity token."""
+
+
 class AO3ActionError(AO3Error):
-    """AO3 rejected or does not support a requested write operation."""
+    """AO3 rejected or does not support a requested operation."""
 
 
 class AO3InvalidURLError(AO3Error, ValueError):

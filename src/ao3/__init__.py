@@ -5,6 +5,7 @@ from ao3.comment import Comment
 from ao3.exceptions import (
     AO3ActionError,
     AO3AuthenticationError,
+    AO3CSRFError,
     AO3Error,
     AO3InvalidURLError,
     AO3ParseError,
@@ -22,6 +23,7 @@ from ao3.work import Chapter, Kudos, Work
 __all__ = [
     "AO3ActionError",
     "AO3AuthenticationError",
+    "AO3CSRFError",
     "AO3Client",
     "AO3Error",
     "AO3InvalidURLError",
